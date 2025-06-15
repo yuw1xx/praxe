@@ -1,0 +1,121 @@
+#!/bin/bash
+
+# Color/style definitions using escapes (could switch to tput if desired)
+BOLD="\e[1m"
+RESET="\e[0m"
+BLUE="${BOLD}\e[34m"
+GREEN="${BOLD}\e[1;38;5;120m"
+YELLOW="${BOLD}\e[33m"
+RED="${BOLD}\e[31m"
+
+LOGFILE="getphoto.log"
+exec > >(tee -a "$LOGFILE") 2>&1
+
+# Spinner function to show while a process runs
+spinner() {
+  local pid=$1
+  local message=$2
+  local spinchars='|/-\\'
+  local i=0
+  local interval=0.1
+  local cols=50  # max chars to clear (adjust as needed)
+
+  while kill -0 "$pid" 2>/dev/null; do
+    i=$(( (i+1) %4 ))
+    printf "\r%-*s\r" "$cols" ""  # clear line fully
+    printf "%s %s" "$message" "${spinchars:$i:1}" >&2
+    sleep $interval
+  done
+  printf "\r%-*s\r" "$cols" ""  # clear line fully after done
+  echo "$message done." >&2
+}
+
+# Dot animation while waiting for file
+wait_for_file() {
+  local file=$1
+  local timeout=$2
+  local elapsed=0
+  local interval=0.3
+  local dots=""
+  local cols=60  # max chars to clear line (adjust if needed)
+
+  echo -ne "${BLUE}[INFO]${RESET} Waiting for $file to finish writing..."
+
+  while [ ! -s "$file" ] && (( $(echo "$elapsed < $timeout" | bc -l) )); do
+    dots="${dots}."
+    [[ ${#dots} -gt 3 ]] && dots=""
+    printf "\r%-*s\r" "$cols" ""  # clear line fully
+    printf "${BLUE}[INFO]${RESET} Waiting for $file to finish writing%s" "$dots" >&2
+    sleep $interval
+    elapsed=$(echo "$elapsed + $interval" | bc)
+  done
+
+  printf "\r%-*s\r" "$cols" ""  # clear line fully before printing result
+
+  if [ -s "$file" ]; then
+    echo -e "${GREEN}[SUCCESS]${RESET} File $file is ready!"
+  else
+    echo -e "${RED}[ERROR]${RESET} Timeout waiting for $file."
+  fi
+}
+
+# Header for logs and terminal output
+echo -e "${BLUE}==================================${RESET}"
+echo -e "${BLUE}          Starting getphoto         ${RESET}"
+echo -e "${BLUE}==================================${RESET}"
+
+# Clean up previous images
+rm -f captured_raw*.jpg captured.png
+
+# Attempt to find USB device for the webcam
+VIDEO_DEV_PATH=$(readlink -f /sys/class/video4linux/video0/device 2>/dev/null)
+USB_DEV=$(basename "$(dirname "$VIDEO_DEV_PATH" 2>/dev/null)")
+
+if [ -n "$USB_DEV" ] && [ -e "/sys/bus/usb/drivers/uvcvideo/$USB_DEV" ]; then
+  echo -e "${BLUE}[INFO]${RESET} Unbinding $USB_DEV from uvcvideo..."
+  echo "$USB_DEV" | sudo tee /sys/bus/usb/drivers/uvcvideo/unbind
+else
+  echo -e "${BLUE}[INFO]${RESET} No uvcvideo-bound USB device found or already unbound"
+fi
+
+sleep 2
+
+BASE_NAME="captured_raw"
+FINAL_JPG="${BASE_NAME}-1.jpg"
+FINAL_PNG="captured.png"
+
+echo -e "${BLUE}[INFO]${RESET} Capturing image using guvcview..."
+
+# Run guvcview in background
+guvcview -d /dev/video0 -x 356x292 -f S680 -F 5 -i "$(pwd)/$BASE_NAME.jpg" \
+  --photo_timer=2 --photo_total=1 --gui=none --render=none --exit_on_term >/dev/null 2>&1 &
+
+G_PID=$!
+
+# Show spinner while guvcview is running
+spinner "$G_PID" "Capturing image..."
+
+wait $G_PID
+
+# Wait for file to finish writing with dots animation (max 15 seconds)
+wait_for_file "$FINAL_JPG" 15
+
+# Give system a moment to finish I/O
+sleep 0.5
+
+echo -e "${BLUE}[INFO]${RESET} Converting $FINAL_JPG to PNG..."
+if convert "$FINAL_JPG" "$FINAL_PNG" 2>convert.log; then
+  echo -e "${GREEN}[SUCCESS]${RESET} Image saved to $FINAL_PNG"
+else
+  echo -e "${YELLOW}[WARNING]${RESET} Image converted with warnings (see convert.log)"
+  echo -e "${GREEN}[SUCCESS]${RESET} Image likely saved, but check manually: $FINAL_PNG"
+fi
+
+# Cleanup JPG
+rm -f "$FINAL_JPG"
+
+# Move PNG to logs
+mkdir -p logs/getphoto
+timestamp=$(date +"%Y_%m_%d_%H-%M-%S")
+mv "$FINAL_PNG" "logs/getphoto/${timestamp}.png"
+echo -e "${GREEN}[SUCCESS]${RESET} Image saved to logs/getphoto/${timestamp}.png"
